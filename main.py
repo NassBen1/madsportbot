@@ -1,11 +1,21 @@
-# main.py — Stock par coloris+variante+taille (depuis l’onglet Stock)
-# - Affiche stock total par variante
-# - Boutons de tailles avec (stock). Si 0 => bouton inactif (callback neutre)
-import os, asyncio, time, urllib.parse
+# main.py — aiogram v3 / Webhook-ready
+# Parcours : Club → Coloris (validation) → Variante (prix + stock total) → Taille (stock par taille) → Panier → Récap → Paiement
+# + Fallback texte pour capter le "Nom complet" (puis téléphone, adresse)
+
+import os
+import asyncio
+import time
+import urllib.parse
 from pathlib import Path
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton,
+    InputMediaPhoto
+)
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
 
@@ -23,71 +33,70 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
 
-def _parse_admins(s: str|None):
-    out=[]
+def _parse_admins(s: str | None):
+    out = []
     for x in (s or "").split(","):
-        x=x.strip()
-        if not x: continue
-        try: out.append(int(x))
-        except: pass
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            out.append(int(x))
+        except Exception:
+            pass
     return out
 
-ADMINS = _parse_admins(os.getenv("ADMINS",""))
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME","").lstrip("@").strip()
+ADMINS = _parse_admins(os.getenv("ADMINS", ""))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "").lstrip("@").strip()
 
-PAYPAL_ME = os.getenv("PAYPAL_ME","").strip().replace("https://paypal.me/","").replace("paypal.me/","").lstrip("/")
-def paypal_link(order_id:int, total:int):
-    if not PAYPAL_ME: return None
-    return f"https://www.paypal.me/{PAYPAL_ME}/{total/100:.2f}"
+PAYPAL_ME = os.getenv("PAYPAL_ME", "").strip().replace("https://paypal.me/", "").replace("paypal.me/", "").lstrip("/")
+def paypal_link(order_id: int, total_cents: int):
+    if not PAYPAL_ME:
+        return None
+    return f"https://www.paypal.me/{PAYPAL_ME}/{total_cents/100:.2f}"
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-checkout = {}  # uid -> {"_active":True, "_stage": ...}
+# État simple en mémoire pour le checkout
+checkout: dict[int, dict] = {}  # uid -> {"_active": True/False, "_stage": "confirm|name|phone|address", "name":..., "phone":..., "address":...}
 
-def money(c): return f"{int(c)/100:.2f} €"
+# ------------------ Utils UI ------------------
+def money(cents: int) -> str:
+    return f"{int(cents)/100:.2f} €"
+
 def support_url():
-    if ADMIN_USERNAME: return f"https://t.me/{ADMIN_USERNAME}"
+    if ADMIN_USERNAME:
+        return f"https://t.me/{ADMIN_USERNAME}"
     for a in ADMINS:
-        if a>0: return f"tg://user?id={a}"
+        if a > 0:
+            return f"tg://user?id={a}"
     return None
 
 def kb_support_row():
-    url=support_url()
-    if url: return [InlineKeyboardButton(text="🆘 Aide", url=url)]
+    url = support_url()
+    if url:
+        return [InlineKeyboardButton(text="🆘 Aide", url=url)]
     return [InlineKeyboardButton(text="🆘 Aide", callback_data="help")]
 
-async def safe_edit(ev, text, reply_markup=None, parse_mode="Markdown"):
+async def safe_edit(ev, text: str, reply_markup=None, parse_mode="Markdown"):
+    """Édite si possible, sinon envoie un nouveau message."""
     if isinstance(ev, Message):
-        await ev.answer(text, parse_mode=parse_mode, reply_markup=reply_markup); return
-    m=ev.message
+        await ev.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return
+    m = ev.message
     try:
-        if m.content_type in ("photo","video","animation","document"):
+        if m.content_type in ("photo", "video", "animation", "document"):
             await m.edit_caption(caption=text, parse_mode=parse_mode, reply_markup=reply_markup)
         else:
             await m.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
     except TelegramBadRequest:
         await m.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
 
-# ------------------ Helpers ------------------
-def _colors(p): return p.get("colors") or []
-def _color_index(p, color):
-    try: return _colors(p).index(color)
-    except ValueError: return -1
-def _color_by_index(p, ci):
-    cols = _colors(p)
-    return cols[ci] if 0 <= ci < len(cols) else None
-
-def _variants_for_color(p, color):
-    return get_variants_for(p, color) or []
-
-def _variant_index(variants, name):
-    try: return variants.index(name)
-    except ValueError: return -1
-
-def _chunk(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
+def clubs_kb():
+    rows = [[InlineKeyboardButton(text=c, callback_data=f"club:{urllib.parse.quote(c)}")] for c in list_clubs()]
+    rows.append([InlineKeyboardButton(text="📦 Panier", callback_data="cart:view")])
+    rows.append(kb_support_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def order_summary_text(uid: int) -> str:
     items = carts[uid]
@@ -95,7 +104,8 @@ def order_summary_text(uid: int) -> str:
         return "Panier vide."
     lines = ["🧾 *Récapitulatif de ta commande*"]
     for i, it in enumerate(items, start=1):
-        qty = int(it.get("qty",1)); price = int(it.get("price_cents",0))*qty
+        qty = int(it.get("qty", 1))
+        price = int(it.get("price_cents", 0)) * qty
         color = it.get("color") or "—"
         variant = it.get("variant") or "—"
         lines.append(f"{i}. {it['club']} • {color} • {variant} • T.{it['size']} x{qty} — {money(price)}")
@@ -104,12 +114,49 @@ def order_summary_text(uid: int) -> str:
     return "\n".join(lines)
 
 def min_price_for_product(p: dict) -> int:
-    prices = [int(p.get("price_cents",0))]
+    prices = [int(p.get("price_cents", 0))]
     for sub in (p.get("color_variant_price_map") or {}).values():
         for v in sub.values():
-            try: prices.append(int(v))
-            except: pass
+            try:
+                prices.append(int(v))
+            except Exception:
+                pass
     return min(prices) if prices else 0
+
+# ------------------ Helpers produit/couleur/variantes ------------------
+def _colors(p): return p.get("colors") or []
+
+def _color_index(p, color):
+    try:
+        return _colors(p).index(color)
+    except ValueError:
+        return -1
+
+def _color_by_index(p, ci):
+    cols = _colors(p)
+    return cols[ci] if 0 <= ci < len(cols) else None
+
+def _variants_for_color(p, color):
+    return get_variants_for(p, color) or []
+
+def _variant_index(variants, name):
+    try:
+        return variants.index(name)
+    except ValueError:
+        return -1
+
+def _chunk(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+def _variant_total_stock(p, color, variant):
+    try:
+        return int(sum_stock_for(p, color, variant))
+    except Exception:
+        return 0
+
+def _sizes_for(p, color, variant):
+    return get_sizes_for(p, color=color, variant=variant) or []
 
 # ------------------ Commands ------------------
 @dp.message(CommandStart())
@@ -117,7 +164,7 @@ async def start(m: Message):
     if m.from_user.id in ADMINS:
         await m.answer("✅ Admin reconnu. Vous recevrez les notifications.")
     await m.answer(
-        "🏟️ *Bienvenue !* Parcours : Club → Coloris → *Validation* → Variante (stock/price) → *Taille (stock)* → Panier → *Récap* → Paiement.\n"
+        "🏟️ *Bienvenue !*\nParcours : Club → Coloris → *Validation* → Variante → *Taille* → Panier → *Récap* → Paiement.\n\n"
         "• /catalogue — Clubs\n• /panier — Voir le panier\n• /commander — Finaliser",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -131,12 +178,6 @@ async def start(m: Message):
 async def cmd_catalog(m: Message):
     await m.answer("Choisis ton *club* :", parse_mode="Markdown", reply_markup=clubs_kb())
 
-def clubs_kb():
-    rows=[[InlineKeyboardButton(text=c, callback_data=f"club:{urllib.parse.quote(c)}")] for c in list_clubs()]
-    rows.append([InlineKeyboardButton(text="📦 Panier", callback_data="cart:view")])
-    rows.append(kb_support_row())
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
 @dp.message(Command("panier"))
 async def cmd_cart(m: Message):
     await cart_view(m)
@@ -145,30 +186,30 @@ async def cmd_cart(m: Message):
 async def cmd_order(m: Message):
     await start_checkout(m.from_user.id, m)
 
-@dp.callback_query(F.data=="help")
+@dp.callback_query(F.data == "help")
 async def cb_help(cb: CallbackQuery):
-    url=support_url()
+    url = support_url()
     if url:
         await cb.message.answer("Besoin d’aide ? Ouvre la conversation :", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Contacter", url=url)]]))
     else:
         await cb.message.answer("Besoin d’aide ? Utilise /help")
 
 # ------------------ Catalogue ------------------
-@dp.callback_query(F.data=="clubs")
+@dp.callback_query(F.data == "clubs")
 async def back_clubs(cb: CallbackQuery):
     await cb.message.answer("Choisis ton *club* :", parse_mode="Markdown", reply_markup=clubs_kb())
 
 @dp.callback_query(F.data.startswith("club:"))
 async def pick_club(cb: CallbackQuery):
-    club = urllib.parse.unquote(cb.data.split(":",1)[1])
+    club = urllib.parse.unquote(cb.data.split(":", 1)[1])
     prods = list_products(club=club)
     if not prods:
-        await safe_edit(cb, "Aucun maillot trouvé pour ce club.", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Clubs", callback_data="clubs")], kb_support_row()]));
+        await safe_edit(cb, "Aucun maillot trouvé pour ce club.", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Clubs", callback_data="clubs")], kb_support_row()]))
         return
     p = prods[0]
     colors = _colors(p)
     minp = min_price_for_product(p)
-    price_line = f"Prix: {money(minp)}" if minp == int(p.get("price_cents",0)) else f"Prix: à partir de {money(minp)}"
+    price_line = f"Prix: {money(minp)}" if minp == int(p.get("price_cents", 0)) else f"Prix: à partir de {money(minp)}"
     caption = (
         f"*{p['name']}* — {p['club']}\n"
         f"{price_line}\n"
@@ -193,14 +234,13 @@ async def pick_club(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("color:"))
 async def pick_color(cb: CallbackQuery):
     _, pid_str, color_enc = cb.data.split(":")
-    pid = int(pid_str); color = urllib.parse.unquote(color_enc) if color_enc else None
+    pid = int(pid_str)
+    color = urllib.parse.unquote(color_enc) if color_enc else None
     p = get_product(pid)
     if not p:
         await cb.answer("Indisponible", show_alert=True); return
-
     if not color:
-        await cb.answer("Choisis d’abord un coloris.", show_alert=True)
-        return
+        await cb.answer("Choisis d’abord un coloris.", show_alert=True); return
 
     caption = (
         f"*{p['name']}* ({p['club']})\n"
@@ -246,24 +286,18 @@ async def color_change(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("color_ok:"))
 async def color_ok(cb: CallbackQuery):
     _, pid_str, color_enc = cb.data.split(":")
-    pid = int(pid_str); color = urllib.parse.unquote(color_enc)
+    pid = int(pid_str)
+    color = urllib.parse.unquote(color_enc)
     p = get_product(pid)
     if not p:
         await cb.answer("Indisponible", show_alert=True); return
 
     variants = _variants_for_color(p, color)
     if variants:
-        await ask_variant(cb, p, color=color)
-        return
+        await ask_variant(cb, p, color=color); return
     await ask_size(cb, p, color=color, variant=None)
 
-# ---------- Étape Variante (affiche stock total) ----------
-def _variant_total_stock(p, color, variant):
-    try:
-        return int(sum_stock_for(p, color, variant))
-    except Exception:
-        return 0
-
+# ---------- Étape Variante (affiche stock total + prix) ----------
 async def ask_variant(cb: CallbackQuery, p: dict, color: str):
     variants = _variants_for_color(p, color)
     caption = (
@@ -275,12 +309,9 @@ async def ask_variant(cb: CallbackQuery, p: dict, color: str):
     rows = []
     for vi, v in enumerate(variants):
         price = get_price_for(p, v, color)
-        tot  = _variant_total_stock(p, color, v)
+        tot = _variant_total_stock(p, color, v)
         label = f"{v} — {money(price)} • Stock: {tot}"
-        rows.append([InlineKeyboardButton(
-            text=label,
-            callback_data=f"variant_i:{p['id']}:{ci}:{vi}"
-        )])
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"variant_i:{p['id']}:{ci}:{vi}")])
     rows.append([InlineKeyboardButton(text="🔁 Changer de coloris", callback_data=f"color_change:{p['id']}")])
     rows.append([InlineKeyboardButton(text="📦 Panier", callback_data="cart:view")])
     rows.append([InlineKeyboardButton(text="⬅️ Clubs", callback_data="clubs")])
@@ -307,7 +338,7 @@ async def variant_pick(cb: CallbackQuery):
         await cb.answer("Option expirée. Reviens au coloris.", show_alert=True); return
     variant = variants[vi]
     price = get_price_for(p, variant, color)
-    tot   = _variant_total_stock(p, color, variant)
+    tot = _variant_total_stock(p, color, variant)
 
     caption = (
         f"*{p['name']}* ({p['club']})\n"
@@ -358,10 +389,7 @@ async def variant_ok(cb: CallbackQuery):
     await ask_size(cb, p, color=color, variant=variant, vi=vi)
 
 # ---------- Étape TAILLE (boutons avec stock ; 0 => inactif) ----------
-def _sizes_for(p, color, variant):
-    return get_sizes_for(p, color=color, variant=variant) or []
-
-async def ask_size(cb: CallbackQuery, p: dict, color: str, variant: str|None, vi: int|None=None):
+async def ask_size(cb: CallbackQuery, p: dict, color: str, variant: str | None, vi: int | None = None):
     sizes = _sizes_for(p, color, variant)
     stock = get_stock_for(p, color, variant) if variant else {}
     if not sizes:
@@ -374,25 +402,22 @@ async def ask_size(cb: CallbackQuery, p: dict, color: str, variant: str|None, vi
         f"Sélectionne une *taille* :"
     ).strip()
 
-    rows=[]
+    rows = []
     ci = _color_index(p, color)
     if vi is None and variant is not None:
         vi = _variant_index(_variants_for_color(p, color), variant)
-    if vi is None: vi = -1  # pas de variante
+    if vi is None:
+        vi = -1  # pas de variante
 
     # 3 colonnes max
-    chunked = list(_chunk(list(enumerate(sizes)), 3))
-    for row in chunked:
+    for row in _chunk(list(enumerate(sizes)), 3):
         btns = []
         for si, s in row:
             q = int(stock.get(s, 0))
             label = f"{s} ({q})" if q > 0 else f"{s} (0)"
-            if q > 0:
-                cbdata = f"size_ok_i:{p['id']}:{ci}:{vi}:{si}"
-            else:
-                cbdata = f"size_na_i:{p['id']}:{ci}:{vi}:{si}"
+            cbdata = f"size_ok_i:{p['id']}:{ci}:{vi}:{si}" if q > 0 else f"size_na_i:{p['id']}:{ci}:{vi}:{si}"
             btns.append(InlineKeyboardButton(text=label, callback_data=cbdata))
-        rows.append(btns)
+        btns and rows.append(btns)
 
     if vi >= 0:
         rows.append([InlineKeyboardButton(text="🔁 Changer de variante", callback_data=f"variant_change_i:{p['id']}:{ci}")])
@@ -429,7 +454,7 @@ async def size_ok(cb: CallbackQuery):
         await cb.answer("Option expirée. Reviens au coloris.", show_alert=True); return
     size = sizes[si]
 
-    # Vérification stock temps réel
+    # Vérification stock en temps réel
     q = int(get_stock_for(p, color, variant).get(size, 0)) if variant else 0
     if q <= 0:
         await cb.answer("Cette taille vient de passer à 0. Choisis-en une autre.", show_alert=True)
@@ -451,14 +476,8 @@ async def size_ok(cb: CallbackQuery):
     ])
     await cb.message.answer("Que souhaites-tu faire ?", reply_markup=kb)
 
-# ------------------ Panier / Checkout identiques ------------------
-def clubs_kb():
-    rows=[[InlineKeyboardButton(text=c, callback_data=f"club:{urllib.parse.quote(c)}")] for c in list_clubs()]
-    rows.append([InlineKeyboardButton(text="📦 Panier", callback_data="cart:view")])
-    rows.append(kb_support_row())
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-@dp.callback_query(F.data=="cart:view")
+# ------------------ Panier ------------------
+@dp.callback_query(F.data == "cart:view")
 async def cart_view_cb(cb: CallbackQuery):
     await cart_view(cb)
 
@@ -468,10 +487,11 @@ async def cart_view(ev):
     if not items:
         await safe_edit(ev, "Panier vide.", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Clubs", callback_data="clubs")], kb_support_row()]))
         return
-    lines=["🧺 *Panier*"]
+    lines = ["🧺 *Panier*"]
     for i, it in enumerate(items, start=1):
         base = f"{i}. {it['club']} • {it.get('color') or '—'} • {it.get('variant') or '—'} • T.{it['size']}"
-        qty = int(it.get("qty",1)); price = int(it.get("price_cents",0))*qty
+        qty = int(it.get("qty", 1))
+        price = int(it.get("price_cents", 0)) * qty
         lines.append(f"{base} x{qty} – {money(price)}")
     lines.append(f"\nTotal: *{money(cart_total_cents(uid))}*")
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -481,14 +501,17 @@ async def cart_view(ev):
     ])
     await safe_edit(ev, "\n".join(lines), kb)
 
-@dp.callback_query(F.data=="cart:rm0")
+@dp.callback_query(F.data == "cart:rm0")
 async def cart_rm0(cb: CallbackQuery):
-    remove_from_cart(cb.from_user.id, 0); await cart_view(cb)
+    remove_from_cart(cb.from_user.id, 0)
+    await cart_view(cb)
 
-@dp.callback_query(F.data=="cart:empty")
+@dp.callback_query(F.data == "cart:empty")
 async def cart_empty(cb: CallbackQuery):
-    empty_cart(cb.from_user.id); await cart_view(cb)
+    empty_cart(cb.from_user.id)
+    await cart_view(cb)
 
+# ------------------ Checkout ------------------
 async def start_checkout(uid: int, reply_target: Message):
     if not carts[uid]:
         await reply_target.answer("Ton panier est vide.", reply_markup=clubs_kb()); return
@@ -502,11 +525,11 @@ async def start_checkout(uid: int, reply_target: Message):
     await reply_target.answer(txt, parse_mode="Markdown", reply_markup=kb)
     checkout[uid] = {"_active": True, "_stage": "confirm"}
 
-@dp.callback_query(F.data=="checkout:start")
+@dp.callback_query(F.data == "checkout:start")
 async def chk_start(cb: CallbackQuery):
     await start_checkout(cb.from_user.id, cb.message)
 
-@dp.callback_query(F.data=="checkout:confirm")
+@dp.callback_query(F.data == "checkout:confirm")
 async def chk_confirm(cb: CallbackQuery):
     uid = cb.from_user.id
     if not carts[uid]:
@@ -517,20 +540,27 @@ async def chk_confirm(cb: CallbackQuery):
 @dp.message(F.contact)
 async def got_contact(m: Message):
     uid = m.from_user.id
-    st = checkout.get(uid,{}).get("_stage")
-    if not checkout.get(uid,{}).get("_active"):
-        return await start_checkout(uid, m)
+    st = (checkout.get(uid, {}) or {}).get("_stage")
+    if not (checkout.get(uid, {}) or {}).get("_active"):
+        await start_checkout(uid, m); return
+
     if st != "phone":
         checkout[uid]["_stage"] = "name"
-        await m.answer("Je te demanderai ton numéro après le nom 😉\n\nD’abord, ton *nom complet* :", parse_mode="Markdown")
+        await m.answer(
+            "Je te demanderai ton numéro *après* le nom 😉\n\nD’abord, ton *nom complet* :",
+            parse_mode="Markdown"
+        )
         return
+
     checkout[uid]["phone"] = m.contact.phone_number
     if not checkout[uid].get("name"):
-        checkout[uid]["_stage"]="name"; await m.answer("Ton *nom complet* ?")
+        checkout[uid]["_stage"] = "name"
+        await m.answer("Ton *nom complet* ?", parse_mode="Markdown")
     else:
-        checkout[uid]["_stage"]="address"; await m.answer("🏠 *Adresse complète* :", parse_mode="Markdown")
+        checkout[uid]["_stage"] = "address"
+        await m.answer("🏠 *Adresse complète* :", parse_mode="Markdown")
 
-@dp.callback_query(F.data=="order:new")
+@dp.callback_query(F.data == "order:new")
 async def order_new(cb: CallbackQuery):
     empty_cart(cb.from_user.id)
     checkout.pop(cb.from_user.id, None)
@@ -540,8 +570,8 @@ async def finalize_order(m: Message, uid: int):
     items = carts[uid]; total = cart_total_cents(uid); oid = int(time.time())
     order = {
         "order_id": oid, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "user_id": uid, "name": checkout[uid].get("name",""),
-        "phone": checkout[uid].get("phone",""), "address": checkout[uid].get("address",""),
+        "user_id": uid, "name": checkout[uid].get("name", ""),
+        "phone": checkout[uid].get("phone", ""), "address": checkout[uid].get("address", ""),
         "items_json": items, "total_cents": total, "status": "new",
     }
     append_order(order)
@@ -549,25 +579,82 @@ async def finalize_order(m: Message, uid: int):
     head = (f"🆕 Commande #{oid}\n{order['name']} — {order['phone']}\n"
             f"Adresse: {order['address']}\nTotal: {money(total)}")
     for a in ADMINS:
-        try: await bot.send_message(a, head)
-        except: pass
+        try:
+            await bot.send_message(a, head)
+        except Exception:
+            pass
         for it in items:
             cap = f"{it['club']} • {it.get('color') or '—'} • {it.get('variant') or '—'} • T.{it['size']} x{int(it.get('qty',1))} — {money(int(it.get('price_cents',0))*int(it.get('qty',1)))}"
             try:
-                p = get_product(it["id"]); img = get_image_for(p, color=it.get('color'), variant=it.get('variant'))
+                p = get_product(it["id"])
+                img = get_image_for(p, color=it.get('color'), variant=it.get('variant'))
                 if img: await bot.send_photo(a, img, caption=cap)
                 else:   await bot.send_message(a, cap)
-            except: pass
+            except Exception:
+                pass
 
     pay_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💸 Payer via PayPal (entre proches)", url=paypal_link(oid, total) or "https://www.paypal.me/")],
         [InlineKeyboardButton(text="🛍️ Nouvelle commande", callback_data="order:new")],
         kb_support_row()
     ])
-    await m.answer(f"✅ Commande #{oid} enregistrée.\nTotal: *{money(total)}*\n\nClique pour *payer via PayPal.me* et ajoute en note: `Commande #{oid}`.", parse_mode="Markdown", reply_markup=pay_kb)
+    await m.answer(
+        f"✅ Commande #{oid} enregistrée.\nTotal: *{money(total)}*\n\n"
+        f"Clique pour *payer via PayPal.me* et ajoute en note: `Commande #{oid}`.",
+        parse_mode="Markdown",
+        reply_markup=pay_kb
+    )
     empty_cart(uid); checkout.pop(uid, None)
 
-# ------------------ Run ------------------
+# ------------------ Fallback texte (CAPTE le NOM, puis TEL, puis ADRESSE) ------------------
+@dp.message()  # capte tous les messages, y compris le "nom complet"
+async def on_any_message(m: Message):
+    uid = m.from_user.id
+    st_active = (checkout.get(uid, {}) or {}).get("_active", False)
+    stage = (checkout.get(uid, {}) or {}).get("_stage")
+    txt = (m.text or "").strip()
+
+    if st_active:
+        # Étape NOM
+        if stage == "name" and txt:
+            checkout[uid]["name"] = txt
+            checkout[uid]["_stage"] = "phone"
+            await m.answer(
+                "☎️ Envoie ton *numéro* :",
+                parse_mode="Markdown",
+                reply_markup=ReplyKeyboardMarkup(
+                    resize_keyboard=True, one_time_keyboard=True,
+                    keyboard=[[KeyboardButton(text="📞 Envoyer mon numéro", request_contact=True)]],
+                    input_field_placeholder="Ex: 06 12 34 56 78"
+                )
+            )
+            return
+
+        # Étape TÉLÉPHONE (tapé au clavier)
+        if stage == "phone" and txt:
+            checkout[uid]["phone"] = txt
+            checkout[uid]["_stage"] = "address"
+            await m.answer("🏠 Envoie ton *adresse complète* :", parse_mode="Markdown")
+            return
+
+        # Étape ADRESSE
+        if stage == "address" and txt:
+            checkout[uid]["address"] = txt
+            await finalize_order(m, uid)
+            return
+
+        # En checkout mais message vide / non pertinent
+        if stage in {"name", "phone", "address"} and not txt:
+            await m.answer("Envoie le texte demandé (nom, numéro ou adresse).")
+            return
+
+    # Hors checkout : menu utile
+    await m.answer(
+        "• /catalogue — Clubs\n• /panier — Panier\n• /commander — Finaliser",
+        reply_markup=clubs_kb()
+    )
+
+# ------------------ Run (polling si lancé en direct) ------------------
 async def main():
     await dp.start_polling(bot)
 
