@@ -1,4 +1,4 @@
-# webhook_api.py — FastAPI webhook pour aiogram v3 (Render) avec DEBUG
+# webhook_api.py — FastAPI webhook pour aiogram v3 (Render) — sans allowed_updates
 import os
 import logging
 from contextlib import asynccontextmanager
@@ -28,14 +28,13 @@ async def lifespan(app: FastAPI):
         logging.exception("❌ Échec import main.py (env manquante ?): %s", e)
         raise
 
-    # Installe/replace le webhook
+    # IMPORTANT: ne pas restreindre allowed_updates => Telegram enverra aussi 'message'
     if WEBHOOK_URL:
         try:
             await bot.delete_webhook(drop_pending_updates=True)
             await bot.set_webhook(
                 url=WEBHOOK_URL,
                 secret_token=WEBHOOK_SECRET,
-                allowed_updates=list(dp.resolve_used_update_types()),
             )
             logging.info(f"✅ Webhook installé: {WEBHOOK_URL}")
         except Exception as e:
@@ -83,10 +82,8 @@ async def debug_info():
 # -------- Webhook Telegram --------
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
-    # log basique pour confirmer qu'on reçoit BIEN quelque chose
     logging.info("📩 POST webhook reçu")
 
-    # Vérif header secret (si Telegram l'envoie)
     token_hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if token_hdr and token_hdr != WEBHOOK_SECRET:
         logging.warning("❌ Mauvais secret header: %s", token_hdr)
@@ -103,14 +100,10 @@ async def telegram_webhook(request: Request):
         raise HTTPException(status_code=500, detail="Bot not ready")
 
     try:
-        update = Update.model_validate(payload)  # aiogram v3 (pydantic v2)
-        # log utile: on affiche le type d'update
-        ut = None
-        for k in ("message","callback_query","inline_query","my_chat_member","chat_member"):
-            if payload.get(k) is not None:
-                ut = k
-                break
-        logging.info(f"➡️ Type d'update: {ut or 'inconnu'}")
+        update = Update.model_validate(payload)
+        # Log du type d'update
+        ut = next((k for k in ("message","callback_query","inline_query","my_chat_member","chat_member") if payload.get(k) is not None), "inconnu")
+        logging.info(f"➡️ Type d'update: {ut}")
         await dp.feed_update(bot, update)
     except Exception as e:
         logging.exception("❌ Erreur pendant le traitement du webhook: %s", e)
